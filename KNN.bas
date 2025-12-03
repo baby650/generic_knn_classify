@@ -1,21 +1,24 @@
+Attribute VB_Name = "KNN"
 Option Explicit
+' ==============================================================================
+' KNN分類メインモジュール
+' ==============================================================================
 
-' ======== 設定 ========
-Private Const K_NEIGHBORS As Long = 5                   ' 近傍K
-Private Const EPSILON As Double = 0.000000001           ' 0除算回避用
+' --- 定数設定 ---
+Private Const K_NEIGHBORS As Long = 5       ' 近傍数 K
+Private Const EPSILON As Double = 1E-09     ' ゼロ除算回避用の微小値
 
-'==========================================
-' エントリポイント
-'【概要】CSV を読み込み、特徴量列・ラベル列を抽出し、KNN 分類を実行する全体制御処理
-'        ユーザー入力値を含むクエリベクトルを受け取り、最終ラベルと信頼度を表示する
-'==========================================
+' ==============================================================================
+' エントリポイント: KNN分類実行
+' 概要: CSV読み込み -> 特徴量選択 -> 学習 -> ユーザー入力クエリの分類 -> PCA可視化
+' ==============================================================================
 Public Sub main_generic_knn_classify()
     Dim csvPath As Variant
     Dim allData As Variant
     Dim headers As Variant, feature_cols As Variant
     Dim label_col As Long
     Dim X As Variant, y As Variant
-    Dim x_query As Variant
+    Dim x_query() As Double ' Double配列に変更して高速化
     Dim means As Variant, stds As Variant
     Dim top_idx As Variant
     Dim decided_species As String, decided_conf As Double
@@ -26,59 +29,55 @@ Public Sub main_generic_knn_classify()
     Dim strParts() As String
     Dim i As Long, p As Long, k As Long
 
-    Application.ScreenUpdating = False
-    Application.Calculation = xlCalculationManual
+    ' 高速化: 画面更新と自動計算を停止
+    With Application
+        .ScreenUpdating = False
+        .Calculation = xlCalculationManual
+    End With
     
     On Error GoTo ErrHandler
 
-    ' --- CSVファイル選択 ---
+    ' 1. 学習データ(CSV)の選択
     csvPath = Application.GetOpenFilename("CSV Files (*.csv), *.csv", , "学習データ(CSV)を選択してください")
     If csvPath = False Then GoTo Cleanup
 
-    ' --- CSV読み込み ---
+    ' 2. CSV読み込み (UTF-8対応)
     allData = LoadCSV(CStr(csvPath))
     If IsEmpty(allData) Then
         MsgBox "CSVファイルの読み込みに失敗しました。", vbCritical
         GoTo Cleanup
     End If
 
-    ' ヘッダ取得（1行目）
+    ' 3. ヘッダ解析とターゲット列の特定
     headers = GetRowFromArray(allData, 1)
     
-    ' --- ターゲット列名をユーザーに要求 ---
     targetColName = InputBox("分類対象（正解ラベル）の列名を入力してください。", "ターゲット列指定", "species")
     If targetColName = "" Then GoTo Cleanup
     
-    ' ラベル列インデックス検索
     label_col = FindLabelColIndex(headers, targetColName)
     If label_col <= 0 Then
-        MsgBox "データに '" & targetColName & "' 列が見つかりません。", vbCritical
+        MsgBox "列 '" & targetColName & "' が見つかりません。", vbCritical
         GoTo Cleanup
     End If
     
-    ' 特徴量列インデックス取得
+    ' ターゲット列以外を特徴量として抽出
     feature_cols = GetFeatureColIndices(headers, label_col)
     If IsEmpty(feature_cols) Then
         MsgBox "特徴量列が見つかりません。", vbCritical
         GoTo Cleanup
     End If
 
-    ' データセット(X, y)作成
+    ' 4. データセット(X, y)の構築
     parse_dataset_vectors allData, 2, feature_cols, label_col, X, y
     If IsEmpty(X) Then
         MsgBox "学習データが空です。", vbCritical
         GoTo Cleanup
     End If
 
-    ' --- 入力プロンプトの文字列準備 ---
+    ' 5. ユーザーからのクエリ入力
     p = UBound(feature_cols) - LBound(feature_cols) + 1
-    featureNameList = ""
-    For k = 1 To p
-        If featureNameList <> "" Then featureNameList = featureNameList & ", "
-        featureNameList = featureNameList & headers(CLng(feature_cols(k)))
-    Next k
+    featureNameList = JoinFeatures(headers, feature_cols) ' ヘルパー関数で結合
 
-    ' --- 特徴量のユーザー入力 ---
     inputStr = InputBox("特徴量をカンマ区切りで入力してください" & vbCrLf & _
                         "項目数: " & p & vbCrLf & _
                         "項目順: " & featureNameList, _
@@ -86,23 +85,22 @@ Public Sub main_generic_knn_classify()
     If inputStr = "" Then GoTo Cleanup
 
     strParts = Split(inputStr, ",")
-    
     If UBound(strParts) + 1 <> p Then
-        MsgBox "入力された値の数が特徴量の数(" & p & ")と一致しません。" & vbCrLf & _
-               "期待される項目: " & featureNameList, vbExclamation
+        MsgBox "入力値の数が特徴量数(" & p & ")と一致しません。", vbExclamation
         GoTo Cleanup
     End If
 
-    ' クエリベクトル作成
+    ' クエリベクトル作成 (Double型へ変換)
     ReDim x_query(1 To p)
     For i = 0 To UBound(strParts)
         x_query(i + 1) = to_double(Trim(strParts(i)))
     Next i
 
-    ' 標準化用統計量算出
+    ' 6. 学習と推論
+    ' 標準化用の統計量算出
     calc_mean_std X, means, stds
 
-    ' KNN 実行
+    ' KNN実行 (距離計算 -> ソート -> 投票)
     top_idx = topk_neighbors(X, x_query, means, stds, K_NEIGHBORS)
     knn_final_decision X, y, x_query, top_idx, means, stds, decided_species, decided_conf
 
@@ -110,28 +108,28 @@ Public Sub main_generic_knn_classify()
     MsgBox "分類結果: " & decided_species & vbCrLf & _
            "信頼度: " & Format(decided_conf, "0.0%"), vbInformation, "KNN推論結果"
 
+    ' 7. PCAグラフ作成 (可視化モジュール呼び出し)
+    CreatePCAGraph X, y, x_query, decided_species
+
 Cleanup:
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
+    ' アプリケーション設定の復元
+    With Application
+        .Calculation = xlCalculationAutomatic
+        .ScreenUpdating = True
+    End With
     Exit Sub
 
 ErrHandler:
-    MsgBox "実行時エラーが発生しました。" & vbCrLf & _
-           "エラー番号: " & Err.Number & vbCrLf & _
-           "詳細: " & Err.Description, vbCritical, "エラー"
+    MsgBox "実行時エラー: " & Err.Number & vbCrLf & Err.Description, vbCritical
     Resume Cleanup
 End Sub
 
-'==========================================
-' CSV読み込み
-'【概要】指定した CSV ファイルを丸ごと読み込み、
-'        行×列の 1-based 二次元配列として返す
-'        ・改行コード統一
-'        ・空行の除外
-'        ・単純なカンマ Split による列分割
-'==========================================
-Private Function LoadCSV(ByVal filePath As String) As Variant
-    Dim fso As Object, ts As Object
+' ==============================================================================
+' CSV読み込み (ADODB.Stream使用)
+' 概要: UTF-8のCSVファイルを読み込み、2次元配列として返す
+' ==============================================================================
+Public Function LoadCSV(ByVal filePath As String) As Variant
+    Dim adoSt As Object
     Dim fileContent As String
     Dim lines() As String
     Dim r As Long, c As Long
@@ -140,22 +138,22 @@ Private Function LoadCSV(ByVal filePath As String) As Variant
     Dim rowCount As Long
     Dim data() As Variant
     
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    If Not fso.FileExists(filePath) Then Exit Function
+    Set adoSt = CreateObject("ADODB.Stream")
+    With adoSt
+        .Type = 2 ' adTypeText
+        .Charset = "UTF-8"
+        .Open
+        .LoadFromFile filePath
+        fileContent = .ReadText
+        .Close
+    End With
+    Set adoSt = Nothing
     
-    Set ts = fso.OpenTextFile(filePath, 1)
-    If ts.AtEndOfStream Then
-        ts.Close
-        Exit Function
-    End If
-    
-    fileContent = ts.ReadAll
-    ts.Close
-    
-    fileContent = Replace(fileContent, vbCrLf, vbLf)
-    fileContent = Replace(fileContent, vbCr, vbLf)
+    ' 改行コード統一と行分割
+    fileContent = Replace(Replace(fileContent, vbCrLf, vbLf), vbCr, vbLf)
     lines = Split(fileContent, vbLf)
     
+    ' 有効行数のカウント (末尾の空行除外)
     rowCount = UBound(lines) + 1
     Do While rowCount > 0
         If Trim(lines(rowCount - 1)) <> "" Then Exit Do
@@ -164,29 +162,26 @@ Private Function LoadCSV(ByVal filePath As String) As Variant
     
     If rowCount <= 0 Then Exit Function
     
+    ' 列数決定と配列確保
     cols = Split(lines(0), ",")
     maxCol = UBound(cols) + 1
-    
     ReDim data(1 To rowCount, 1 To maxCol)
     
+    ' データ格納
     For r = 0 To rowCount - 1
         cols = Split(lines(r), ",")
         For c = 0 To UBound(cols)
-            If c < maxCol Then
-                data(r + 1, c + 1) = Trim(cols(c))
-            End If
+            If c < maxCol Then data(r + 1, c + 1) = Trim(cols(c))
         Next c
     Next r
     
     LoadCSV = data
 End Function
 
-'==========================================
-' 配列の指定行を1次元配列として返す
-'【概要】2次元配列 data の rowIdx 行目だけを切り出し、
-'        1次元配列に変換して返す
-'==========================================
-Private Function GetRowFromArray(ByVal data As Variant, ByVal rowIdx As Long) As Variant
+' ==============================================================================
+' 配列操作ヘルパー: 指定行の抽出
+' ==============================================================================
+Public Function GetRowFromArray(ByVal data As Variant, ByVal rowIdx As Long) As Variant
     Dim c As Long, cols As Long
     cols = UBound(data, 2)
     Dim res() As Variant
@@ -197,19 +192,14 @@ Private Function GetRowFromArray(ByVal data As Variant, ByVal rowIdx As Long) As
     GetRowFromArray = res
 End Function
 
-'==========================================
-' データセット(X, y)ベクトル作成
-'【概要】全データ allData から
-'        ・特徴量行列 X(m, p)
-'        ・ラベルベクトル y(m, 1)
-'        を抽出して生成する
-'==========================================
-Private Sub parse_dataset_vectors(ByVal allData As Variant, ByVal startRow As Long, _
+' ==============================================================================
+' データセット構築: 特徴量行列Xとラベルベクトルyの生成
+' ==============================================================================
+Public Sub parse_dataset_vectors(ByVal allData As Variant, ByVal startRow As Long, _
                                   ByVal feature_cols As Variant, ByVal label_col As Long, _
                                   ByRef X As Variant, ByRef y As Variant)
     Dim totalRows As Long
     totalRows = UBound(allData, 1)
-    
     If totalRows < startRow Then Exit Sub
 
     Dim m As Long, p As Long
@@ -220,24 +210,22 @@ Private Sub parse_dataset_vectors(ByVal allData As Variant, ByVal startRow As Lo
     ReDim y(1 To m, 1 To 1)
 
     Dim i As Long, j As Long, rowIdx As Long
+    Dim srcRow As Long
+    
+    ' ループ内で頻繁にアクセスする配列は型指定変数を介すと若干高速
     rowIdx = 0
-    For i = startRow To totalRows
+    For srcRow = startRow To totalRows
         rowIdx = rowIdx + 1
         For j = 1 To p
-            X(rowIdx, j) = allData(i, CLng(feature_cols(j)))
+            X(rowIdx, j) = allData(srcRow, CLng(feature_cols(j)))
         Next j
-        y(rowIdx, 1) = allData(i, label_col)
-    Next i
+        y(rowIdx, 1) = allData(srcRow, label_col)
+    Next srcRow
 End Sub
 
-'==========================================
-' KNN最終決定
-'【概要】近傍 top_idx のラベル y に対し、
-'        ・逆距離重みを計算
-'        ・クラスごとの重み合計を算出
-'        ・最大重みのラベルを予測クラスとする
-'        ・重み比から信頼度を算出
-'==========================================
+' ==============================================================================
+' KNN推論: 最終決定 (重み付き多数決)
+' ==============================================================================
 Private Sub knn_final_decision( _
         ByVal X As Variant, ByVal y As Variant, ByVal xq As Variant, _
         ByVal top_idx As Variant, ByVal means As Variant, ByVal stds As Variant, _
@@ -248,6 +236,7 @@ Private Sub knn_final_decision( _
     Dim labels() As String: ReDim labels(1 To k)
     Dim i As Long, idx As Long, d As Double
 
+    ' 逆距離重みの計算
     For i = 1 To k
         idx = CLng(top_idx(i))
         d = zdist(X, xq, means, stds, idx)
@@ -255,19 +244,23 @@ Private Sub knn_final_decision( _
         labels(i) = CStr(y(idx, 1))
     Next i
 
+    ' クラスごとの重み集計
     Dim dict As Object
     Set dict = CreateObject("Scripting.Dictionary")
+    
     For i = 1 To k
-        If Not dict.Exists(labels(i)) Then
-            dict.Add labels(i), weights(i)
-        Else
+        If dict.Exists(labels(i)) Then
             dict(labels(i)) = dict(labels(i)) + weights(i)
+        Else
+            dict.Add labels(i), weights(i)
         End If
     Next i
 
-    Dim best_label As String: best_label = ""
+    ' 最尤クラスの決定
+    Dim best_label As String
     Dim best_sum As Double: best_sum = -1#
-    Dim key As Variant, total_sum As Double: total_sum = 0#
+    Dim total_sum As Double: total_sum = 0#
+    Dim key As Variant
 
     For Each key In dict.Keys
         If dict(key) > best_sum Then
@@ -282,13 +275,10 @@ Private Sub knn_final_decision( _
     conf_out = best_sum / total_sum
 End Sub
 
-'==========================================
-' ラベル列インデックス検索
-'【概要】ヘッダ配列 headers の中から、
-'        指定ラベル名 labelName と一致する列番号を返す
-'        ※大文字小文字は無視して比較
-'==========================================
-Private Function FindLabelColIndex(ByVal headers As Variant, ByVal labelName As String) As Long
+' ==============================================================================
+' ヘルパー: ラベル列のインデックス検索 (大文字小文字無視)
+' ==============================================================================
+Public Function FindLabelColIndex(ByVal headers As Variant, ByVal labelName As String) As Long
     Dim c As Long, n As Long
     If Not IsArray(headers) Then Exit Function
     n = UBound(headers)
@@ -301,12 +291,10 @@ Private Function FindLabelColIndex(ByVal headers As Variant, ByVal labelName As 
     FindLabelColIndex = 0
 End Function
 
-'==========================================
-' 特徴量列インデックス生成
-'【概要】ヘッダ行から、
-'        ラベル列以外すべてを「特徴量列」としてインデックス配列化する
-'==========================================
-Private Function GetFeatureColIndices(ByVal headers As Variant, ByVal label_col As Long) As Variant
+' ==============================================================================
+' ヘルパー: 特徴量列インデックスの取得 (ラベル列以外)
+' ==============================================================================
+Public Function GetFeatureColIndices(ByVal headers As Variant, ByVal label_col As Long) As Variant
     Dim n As Long, i As Long, k As Long
     If Not IsArray(headers) Then Exit Function
     n = UBound(headers)
@@ -328,46 +316,47 @@ Private Function GetFeatureColIndices(ByVal headers As Variant, ByVal label_col 
     End If
 End Function
 
-'==========================================
-' 平均・標準偏差の算出
-'【概要】特徴量行列 X の各列 p について、
-'        ・平均値 μ
-'        ・標準偏差 σ（母標準偏差）
-'        を計算して返す
-'==========================================
-Private Sub calc_mean_std(ByVal X As Variant, ByRef means As Variant, ByRef stds As Variant)
+' ==============================================================================
+' 統計計算: 平均と標準偏差
+' ==============================================================================
+Public Sub calc_mean_std(ByVal X As Variant, ByRef means As Variant, ByRef stds As Variant)
     Dim m As Long: m = UBound(X, 1)
     Dim p As Long: p = UBound(X, 2)
     ReDim means(1 To p): ReDim stds(1 To p)
     
     Dim j As Long, i As Long
-    Dim s As Double, ss As Double, mu As Double, sigma As Double
+    Dim s As Double, ss As Double, v As Double
+    Dim mu As Double, sigma As Double
 
     For j = 1 To p
         s = 0#: ss = 0#
         For i = 1 To m
-            Dim v As Double: v = to_double(X(i, j))
+            v = to_double(X(i, j))
             s = s + v
             ss = ss + v * v
         Next i
         mu = s / m
+        ' 母分散計算: (Σx^2 / N) - μ^2
         sigma = Sqr(Application.Max(0#, (ss / m) - (mu * mu)))
-        If sigma < 0.000000001 Then sigma = 0.000000001
+        If sigma < EPSILON Then sigma = EPSILON
         means(j) = mu
         stds(j) = sigma
     Next j
 End Sub
 
-'==========================================
-' 標準化距離（ユークリッド距離）の算出
-'【概要】行 X(rowIdx, :) とクエリ xq の
-'        標準化済みベクトル間のユークリッド距離を返す
-'==========================================
-Private Function zdist(ByVal X As Variant, ByVal xq As Variant, ByVal means As Variant, ByVal stds As Variant, ByVal rowIdx As Long) As Double
+' ==============================================================================
+' 距離計算: 標準化ユークリッド距離
+' ==============================================================================
+Private Function zdist(ByVal X As Variant, ByVal xq As Variant, _
+                       ByVal means As Variant, ByVal stds As Variant, _
+                       ByVal rowIdx As Long) As Double
     Dim p As Long: p = UBound(X, 2)
-    Dim j As Long, d As Double, v As Double, q As Double
+    Dim j As Long
+    Dim d As Double, v As Double, q As Double
+    
     d = 0#
     For j = 1 To p
+        ' 事前に計算した平均・標準偏差で標準化しながら距離加算
         v = (to_double(X(rowIdx, j)) - means(j)) / stds(j)
         q = (to_double(xq(j)) - means(j)) / stds(j)
         d = d + (v - q) * (v - q)
@@ -375,15 +364,16 @@ Private Function zdist(ByVal X As Variant, ByVal xq As Variant, ByVal means As V
     zdist = Sqr(d)
 End Function
 
-'==========================================
-' 近傍K件の抽出
-'【概要】全データとクエリの距離を計算し、
-'        (index, distance) のペアを距離昇順でソートして
-'        上位 K 件のデータインデックスを返す
-'==========================================
-Private Function topk_neighbors(ByVal X As Variant, ByVal xq As Variant, ByVal means As Variant, ByVal stds As Variant, ByVal k As Long) As Variant
+' ==============================================================================
+' 近傍探索: 距離計算と上位K件の抽出
+' ==============================================================================
+Private Function topk_neighbors(ByVal X As Variant, ByVal xq As Variant, _
+                                ByVal means As Variant, ByVal stds As Variant, _
+                                ByVal k As Long) As Variant
     Dim m As Long: m = UBound(X, 1)
     If k > m Then k = m
+    
+    ' (index, distance) のペア配列
     Dim pairs() As Variant: ReDim pairs(1 To m, 1 To 2)
     Dim i As Long
     
@@ -392,8 +382,10 @@ Private Function topk_neighbors(ByVal X As Variant, ByVal xq As Variant, ByVal m
         pairs(i, 2) = zdist(X, xq, means, stds, i)
     Next i
 
+    ' 距離でソート
     quicksort_pairs pairs, 1, m
     
+    ' 上位K件のインデックスのみ抽出
     Dim res() As Long: ReDim res(1 To k)
     For i = 1 To k
         res(i) = CLng(pairs(i, 1))
@@ -401,36 +393,48 @@ Private Function topk_neighbors(ByVal X As Variant, ByVal xq As Variant, ByVal m
     topk_neighbors = res
 End Function
 
-'==========================================
-' ペア配列のクイックソート
-'【概要】(index, distance) 形式の 2列配列を
-'        距離列（2列目）で昇順ソートする
-'==========================================
+' ==============================================================================
+' ソート: クイックソート (距離昇順)
+' ==============================================================================
 Private Sub quicksort_pairs(ByRef a() As Variant, ByVal l As Long, ByVal r As Long)
     Dim i As Long, j As Long
     Dim p As Double, t0 As Variant, t1 As Variant
+    
     i = l: j = r
-    p = CDbl(a((l + r) \ 2, 2))
+    p = CDbl(a((l + r) \ 2, 2)) ' ピボット
     
     Do While i <= j
         Do While CDbl(a(i, 2)) < p: i = i + 1: Loop
         Do While CDbl(a(j, 2)) > p: j = j - 1: Loop
         If i <= j Then
+            ' Swap
             t0 = a(i, 1): t1 = a(i, 2)
             a(i, 1) = a(j, 1): a(i, 2) = a(j, 2)
             a(j, 1) = t0: a(j, 2) = t1
             i = i + 1: j = j - 1
         End If
     Loop
+    
     If l < j Then quicksort_pairs a, l, j
     If i < r Then quicksort_pairs a, i, r
 End Sub
 
-'==========================================
-' 数値変換
-'【概要】値が数値なら CDbl により Double 化して返し、
-'        数値でなければ 0 を返す簡易変換関数
-'==========================================
-Private Function to_double(ByVal v As Variant) As Double
+' ==============================================================================
+' ユーティリティ: 数値変換 (非数値は0)
+' ==============================================================================
+Public Function to_double(ByVal v As Variant) As Double
     If IsNumeric(v) Then to_double = CDbl(v) Else to_double = 0#
+End Function
+
+' ==============================================================================
+' ユーティリティ: 特徴量名の結合 (表示用)
+' ==============================================================================
+Private Function JoinFeatures(headers As Variant, feature_cols As Variant) As String
+    Dim k As Long, s As String
+    s = ""
+    For k = LBound(feature_cols) To UBound(feature_cols)
+        If s <> "" Then s = s & ", "
+        s = s & headers(CLng(feature_cols(k)))
+    Next k
+    JoinFeatures = s
 End Function
